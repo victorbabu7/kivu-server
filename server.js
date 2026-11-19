@@ -109,8 +109,10 @@ let admin = null;
 async function getAdmin() {
   if (admin) return admin;
   if (!FIREBASE_SERVICE_ACCOUNT) throw new HttpError(500, "server-not-configured");
-  const raw = FIREBASE_SERVICE_ACCOUNT.trim();
-  const cred = JSON.parse(raw.startsWith("{") ? raw : Buffer.from(raw, "base64").toString("utf8"));
+  let raw = FIREBASE_SERVICE_ACCOUNT.trim().replace(/^["']|["']$/g, "");
+  if (!raw.startsWith("{")) raw = Buffer.from(raw.replace(/\s+/g, ""), "base64").toString("utf8");
+  let cred; try { cred = JSON.parse(raw); } catch { throw new HttpError(500, "service-account-invalid"); }
+  if (!cred.client_email || !cred.private_key) throw new HttpError(500, "service-account-invalid");
   const { initializeApp, cert } = await import("firebase-admin/app");
   const { getAuth } = await import("firebase-admin/auth");
   const { getFirestore, FieldValue } = await import("firebase-admin/firestore");
@@ -130,8 +132,8 @@ app.post("/grade", async (req, res) => {
     res.json(out);
   } catch (e) {
     if (e instanceof HttpError) return res.status(e.status).json({ ok: false, error: e.code });
-    console.error(e && e.message);
-    res.status(500).json({ ok: false, error: "grade-error" });
+    console.error("GRADE ERREUR :", e && (e.code || e.name), "|", e && e.message);
+    res.status(500).json({ ok: false, error: "grade-error", detail: String((e && (e.code || e.name)) || "").slice(0, 60) });
   }
 });
 

@@ -48,7 +48,8 @@ export function grade(quiz, key, answers) {
 export class HttpError extends Error { constructor(status, code) { super(code); this.status = status; this.code = code; } }
 
 // db : instance Firestore (Admin SDK) ; FieldValue : firebase-admin/firestore
-export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, answers, rand }) {
+export const MAX_PER_DAY = 6, DAY = 24 * 3600 * 1000;
+export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, answers, rand, now = Date.now() }) {
   if (typeof courseId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(courseId)) throw new HttpError(400, "course");
   const cs = await db.collection("courses").doc(courseId).get();
   if (!cs.exists) throw new HttpError(404, "course");
@@ -69,10 +70,14 @@ export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, a
   const done = new Set(prev && Array.isArray(prev.done) ? prev.done : []);
   if (!prev || [...Array(nLessons).keys()].some(i => !done.has(i))) throw new HttpError(403, "lessons-incomplete");
 
+  // 6 essais par période de 24 heures et par cours
+  const tries = (prev && Array.isArray(prev.tries) ? prev.tries : []).filter(x => Number.isFinite(x) && now - x < DAY);
+  if (tries.length >= MAX_PER_DAY) throw new HttpError(429, "daily-limit");
+
   const { pct, results } = grade(quiz, k.key, clean);
   const passMark = Math.min(100, Math.max(1, Number(course.passMark) || 70));
   const pass = pct >= passMark;
-  const patch = { score: Math.max(prev.score || 0, pct), attempts: (prev.attempts || 0) + 1, updatedAt: FieldValue.serverTimestamp() };
+  const patch = { score: Math.max(prev.score || 0, pct), attempts: (prev.attempts || 0) + 1, tries: [...tries, now], updatedAt: FieldValue.serverTimestamp() };
   let certCode = prev.certCode || null;
   if (pass) {
     patch.passed = true;
@@ -90,6 +95,6 @@ export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, a
     }
   }
   await pref.set(patch, { merge: true });
-  return { ok: true, pct, pass, passMark, best: patch.score, attempts: patch.attempts, passed: !!(prev.passed || pass), certCode, results,
+  return { ok: true, pct, pass, passMark, best: patch.score, attempts: patch.attempts, triesLeft: MAX_PER_DAY - patch.tries.length, passed: !!(prev.passed || pass), certCode, results,
     explains: pass ? k.key.map(x => x.e || "") : null };
 }

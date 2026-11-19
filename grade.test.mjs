@@ -1,7 +1,7 @@
 // Lancer : npm test  (ne demande ni Firebase ni internet)
 import test from "node:test";
 import assert from "node:assert/strict";
-import { grade, cleanAnswers, answerKey, gradeCourse, newCode, HttpError } from "./grade.js";
+import { grade, cleanAnswers, answerKey, gradeCourse, newCode, HttpError, MAX_PER_DAY, DAY } from "./grade.js";
 
 const quiz = [
   { q: "A", type: "single", options: ["a", "b", "c"] },
@@ -99,4 +99,13 @@ test("seuil de réussite du cours respecté", async () => {
 });
 test("codes de certificat : format valide", () => {
   for (let i = 0; i < 200; i++) assert.match(newCode(), /^KDA-[A-Z0-9]{8}$/);
+});
+
+test("limite : 6 essais par 24 h, puis refus ; l'essai se libère après 24 h", async () => {
+  const db = fakeDb(base()), t0 = 1_700_000_000_000;
+  for (let i = 0; i < MAX_PER_DAY; i++) { const r = await run(db, [0, [0], 1], { now: t0 + i * 1000 }); assert.equal(r.triesLeft, MAX_PER_DAY - 1 - i); }
+  await assert.rejects(run(db, [1, [0, 2], 0], { now: t0 + 10_000 }), e => e instanceof HttpError && e.status === 429 && e.code === "daily-limit");
+  assert.equal(db.store.get("progress/u1_c1").passed, undefined);
+  const r = await run(db, [1, [0, 2], 0], { now: t0 + DAY + 6000 });
+  assert.equal(r.pass, true); assert.equal(r.triesLeft, MAX_PER_DAY - 1);
 });
