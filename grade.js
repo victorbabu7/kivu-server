@@ -87,7 +87,7 @@ export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, a
       for (let t = 0; t < 6 && !certCode; t++) {
         const code = newCode(rand);
         try {
-          await db.collection("certificates").doc(code).create({ code, uid, name, courseId, courseTitle: course.title || "", trainer: course.authorName || "", score: pct, date: FieldValue.serverTimestamp() });
+          await db.collection("certificates").doc(code).create({ code, uid, name, courseId, courseTitle: course.title || "", trainer: course.authorName || "", category: course.category || "", level: course.level || "", hours: Math.round((Number(course.duration) || 0) / 6) / 10 || null, skills: (Array.isArray(course.objectives) ? course.objectives : []).filter(x => typeof x === "string").slice(0, 4).map(x => x.slice(0, 120)), score: pct, date: FieldValue.serverTimestamp() });
           certCode = code;
         } catch (e) { if (t === 5) throw e; }
       }
