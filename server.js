@@ -5,7 +5,7 @@ import express from "express";
 import { gradeCourse, HttpError } from "./grade.js";
 
 const {
-  PORT = 8787, GEMINI_API_KEY, GEMINI_MODEL = "gemini-2.5-flash",
+  PORT = 8787, GEMINI_API_KEY, GEMINI_MODEL = "gemini-2.5-flash", GROQ_API_KEY, GROQ_MODEL = "llama-3.3-70b-versatile", OPENROUTER_API_KEY, OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free",
   FIREBASE_WEB_API_KEY, FIREBASE_PROJECT_ID, ALLOWED_ORIGINS = "", FIREBASE_SERVICE_ACCOUNT
 } = process.env;
 const origins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
@@ -85,9 +85,29 @@ async function gemini(prompt) {
   return JSON.parse(txt.replace(/^```json\s*|```$/g, "").trim());
 }
 
+const parseJson = txt => JSON.parse(String(txt).replace(/^```json\s*|```$/g, "").trim());
+async function openaiLike(url, key, model, prompt) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+    body: JSON.stringify({ model, temperature: 0.6, max_tokens: 4096, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], response_format: { type: "json_object" } }) });
+  if (!r.ok) throw new Error(model + " " + r.status);
+  return parseJson(((await r.json()).choices?.[0]?.message?.content) || "");
+}
+const providers = () => [
+  GEMINI_API_KEY && ["gemini", p => gemini(p)],
+  GROQ_API_KEY && ["groq", p => openaiLike("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, p)],
+  OPENROUTER_API_KEY && ["openrouter", p => openaiLike("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, OPENROUTER_MODEL, p)]
+].filter(Boolean);
+async function askAI(prompt) {
+  let last;
+  for (const [name, run] of providers()) {
+    try { return await run(prompt); } catch (e) { last = e; console.warn("IA " + name + " indisponible :", e.message); }
+  }
+  throw last || new Error("no-provider");
+}
+
 app.post("/ai", async (req, res) => {
   try {
-    if (!GEMINI_API_KEY || !FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID) return res.status(500).json({ ok: false, error: "server-not-configured" });
+    if (!providers().length || !FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID) return res.status(500).json({ ok: false, error: "server-not-configured" });
     const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
     if (!token) return res.status(401).json({ ok: false, error: "auth" });
     const me = await whoIs(token);
@@ -96,7 +116,7 @@ app.post("/ai", async (req, res) => {
     if (!task) return res.status(400).json({ ok: false, error: "task" });
     if (task.teacher && !me.teacher) return res.status(403).json({ ok: false, error: "forbidden" });
     if (limited(me.uid + ":" + req.body.task, task.max)) return res.status(429).json({ ok: false, error: "rate-limit" });
-    const data = await gemini(task.prompt({ ...req.body, lang: req.body.lang === "en" ? "en" : "fr" }));
+    const data = await askAI(task.prompt({ ...req.body, lang: req.body.lang === "en" ? "en" : "fr" }));
     res.json({ ok: true, data });
   } catch (e) {
     console.error(e.message);
