@@ -5,7 +5,7 @@ import express from "express";
 import { gradeCourse, HttpError } from "./grade.js";
 
 const {
-  PORT = 8787, GEMINI_API_KEY, GEMINI_MODEL = "gemini-2.5-flash", GROQ_API_KEY, GROQ_MODEL = "llama-3.3-70b-versatile", OPENROUTER_API_KEY, OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free",
+  PORT = 8787, GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL = "llama-3.3-70b-versatile", OPENROUTER_API_KEY, OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free",
   FIREBASE_WEB_API_KEY, FIREBASE_PROJECT_ID, ALLOWED_ORIGINS = "", FIREBASE_SERVICE_ACCOUNT
 } = process.env;
 const origins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
@@ -75,8 +75,8 @@ Cours : ${D(b.courseTitle)}\nLeçon : ${D(b.lessonTitle)}\nContenu de la leçon 
 Réponse : {"answer":"..."}` }
 };
 
-async function gemini(prompt) {
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+async function gemini(prompt, model) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.6, maxOutputTokens: 4096 } })
   });
@@ -85,17 +85,64 @@ async function gemini(prompt) {
   return JSON.parse(txt.replace(/^```json\s*|```$/g, "").trim());
 }
 
-const parseJson = txt => JSON.parse(String(txt).replace(/^```json\s*|```$/g, "").trim());
+const parseJson = txt => { const t = String(txt); const i = t.indexOf("{"), j = t.lastIndexOf("}"); return JSON.parse(i >= 0 && j > i ? t.slice(i, j + 1) : t); };
 async function openaiLike(url, key, model, prompt) {
-  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-    body: JSON.stringify({ model, temperature: 0.6, max_tokens: 4096, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], response_format: { type: "json_object" } }) });
-  if (!r.ok) throw new Error(model + " " + r.status);
-  return parseJson(((await r.json()).choices?.[0]?.message?.content) || "");
+  const call = async json => {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+      body: JSON.stringify({ model, temperature: 0.6, max_tokens: 4096, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], ...(json ? { response_format: { type: "json_object" } } : {}) }) });
+    if (!r.ok) throw new Error(model + " " + r.status);
+    return parseJson(((await r.json()).choices?.[0]?.message?.content) || "");
+  };
+  try { return await call(true); } catch (e) { if (/ 4(00|22)$/.test(e.message)) return call(false); throw e; }
 }
+const E = process.env;
+/* Les noms de modèles gratuits changent : on lit la liste du fournisseur et on choisit les meilleurs (cache 6 h). */
+const cache = {};
+const ver = id => parseFloat((id.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]);
+const best = (ids, pref, bad) => ids.filter(i => !bad.test(i)).map(i => [i, pref.findIndex(r => r.test(i))]).filter(x => x[1] >= 0)
+  .sort((x, y) => x[1] - y[1] || ver(y[0]) - ver(x[0])).map(x => x[0]).slice(0, 3);
+async function listed(name, load) {
+  const c = cache[name]; if (c && Date.now() - c.t < 6 * 3600e3) return c.v;
+  const v = await load(); cache[name] = { t: Date.now(), v }; return v;
+}
+const GEM_BAD = /image|tts|audio|live|embed|robot|computer|vision|exp|thinking|learnlm|gemma|aqa|imagen|veo|nano|banana/i;
+async function geminiModels() {
+  if (GEMINI_MODEL) return [GEMINI_MODEL];
+  return listed("gemini", async () => {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${GEMINI_API_KEY}`);
+    if (!r.ok) throw new Error("gemini-list " + r.status);
+    const ids = ((await r.json()).models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent")).map(m => m.name.replace(/^models\//, ""));
+    return best(ids, [/flash(?!-lite)/, /flash-lite/, /pro/], GEM_BAD);
+  });
+}
+const OAI = [
+  ["groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1", E.GROQ_MODEL, [/gpt-oss-120b/, /llama-3\.3|llama-4|70b/, /qwen/, /gpt-oss/, /llama/], /whisper|guard|tts|playai|orpheus|safeguard|embed/i],
+  ["cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1", E.CEREBRAS_MODEL, [/gpt-oss-120b/, /llama.*70b|llama-3\.3/, /qwen/, /llama/], /embed|guard/i],
+  ["mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1", E.MISTRAL_MODEL || "mistral-small-latest"],
+  ["openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1", E.OPENROUTER_MODEL, [/gpt-oss-120b/, /llama.*70b/, /qwen.*(72|80|235)b/, /deepseek/, /mistral.*small/, /gemma.*27b/, /free/], /vision|image|audio|embed|guard|lyria|-vl/i],
+  ["github", "GITHUB_MODELS_TOKEN", "https://models.github.ai/inference", E.GITHUB_MODEL || "openai/gpt-4.1-mini"],
+  ["nvidia", "NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1", E.NVIDIA_MODEL || "meta/llama-3.3-70b-instruct"],
+  ["custom", "CUSTOM_API_KEY", (E.CUSTOM_API_URL || "").replace(/\/chat\/completions$/, ""), E.CUSTOM_MODEL]
+];
+async function oaiModels(name, base, key, fixed, pref, bad) {
+  if (fixed) return [fixed];
+  return listed(name, async () => {
+    const r = await fetch(base + "/models", { headers: { Authorization: "Bearer " + key } });
+    if (!r.ok) throw new Error(name + "-list " + r.status);
+    let d = (await r.json()).data || [];
+    if (name === "openrouter") d = d.filter(m => m.pricing && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0 && /:free$/.test(m.id));
+    return best(d.map(m => m.id), pref, bad);
+  });
+}
+const tryEach = async (name, ids, run) => {
+  let last = new Error(name + " aucun modèle");
+  for (const m of ids) { try { return await run(m); } catch (e) { last = e; console.warn("IA " + name + " / " + m + " :", e.message); } }
+  delete cache[name]; throw last;
+};
 const providers = () => [
-  GEMINI_API_KEY && ["gemini", p => gemini(p)],
-  GROQ_API_KEY && ["groq", p => openaiLike("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, p)],
-  OPENROUTER_API_KEY && ["openrouter", p => openaiLike("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, OPENROUTER_MODEL, p)]
+  GEMINI_API_KEY && ["gemini", async p => tryEach("gemini", await geminiModels(), m => gemini(p, m))],
+  ...OAI.filter(([, k, u, m]) => E[k] && u && (m || true)).map(([n, k, base, fixed, pref, bad]) =>
+    (n === "custom" && !fixed) ? null : [n, async p => tryEach(n, await oaiModels(n, base, E[k], fixed, pref, bad), m => openaiLike(base + "/chat/completions", E[k], m, p))])
 ].filter(Boolean);
 async function askAI(prompt) {
   let last;
