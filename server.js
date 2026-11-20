@@ -11,6 +11,7 @@ const {
 const origins = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
 
 const app = express();
+app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use(express.json({ limit: "60kb" }));
 app.use((req, res, next) => {
@@ -70,8 +71,13 @@ ${BLOCKS}\nRéponse : {"blocks":[...]}` },
 Cours : ${D(b.courseTitle)}\nContenu : ${D(b.content)}
 Mélange : choix unique ("single", 3 ou 4 options, "answer" = indice), choix multiples ("multi", "answer" = liste d'indices), vrai ou faux ("tf", options ["Vrai","Faux"], "answer" = 0 ou 1). Ajoute "explain" (une phrase).
 Réponse : {"questions":[{"q":"...","type":"single","options":["..."],"answer":0,"explain":"..."}]}` },
+  site: { teacher: false, max: 15, public: true, prompt: b => `${L(b.lang)} Tu es l'assistant de Kivu Data Academy, un centre de formation en ligne et un incubateur ouverts à tous, partout dans le monde (enfants, étudiants, professionnels, ONG, startups). Réponds en moins de 120 mots, simplement, sans inventer.
+Faits sûrs : inscription gratuite (page « Créer un compte ») ; cours composés de leçons à suivre dans l'ordre, chacune finie par une courte question ; test final avec 6 essais par période de 24 heures ; certificat vérifiable par code ou QR, avec badge numérique, partageable sur LinkedIn ; filières : IA, data, réseaux, cybersécurité, logistique, humanitaire et climat, enfants ; page « Formations » pour le catalogue ; page « Contact » pour écrire à l'équipe, devenir partenaire, sponsor, mentor ou formateur.
+Si tu ne sais pas (prix, dates, détails d'un cours précis), dis-le et renvoie vers la page Contact. Ne demande jamais de mot de passe ni de code.
+${b.page ? "Page actuelle : " + D(b.page) : ""}\n${b.history ? "Échanges précédents : " + D(b.history) + "\n" : ""}Question : ${D(String(b.question || "").slice(0, 500))}
+Réponse : {"answer":"..."}` },
   tutor: { teacher: false, max: 30, prompt: b => `${L(b.lang)} Tu es le tuteur d'un apprenant. Réponds à sa question en t'appuyant d'abord sur la leçon, en moins de 150 mots, avec un exemple simple. Si la question est hors sujet, ramène poliment à la leçon.
-Cours : ${D(b.courseTitle)}\nLeçon : ${D(b.lessonTitle)}\nContenu de la leçon : ${D(b.context)}\nQuestion : ${D(String(b.question || "").slice(0, 500))}
+Cours : ${D(b.courseTitle)}\nLeçon : ${D(b.lessonTitle)}\nContenu de la leçon : ${D(b.context)}\n${b.history ? "Échanges précédents : " + D(b.history) + "\n" : ""}Question : ${D(String(b.question || "").slice(0, 500))}
 Réponse : {"answer":"..."}` }
 };
 
@@ -155,12 +161,16 @@ async function askAI(prompt) {
 app.post("/ai", async (req, res) => {
   try {
     if (!providers().length || !FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID) return res.status(500).json({ ok: false, error: "server-not-configured" });
-    const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-    if (!token) return res.status(401).json({ ok: false, error: "auth" });
-    const me = await whoIs(token);
-    if (!me) return res.status(401).json({ ok: false, error: "auth" });
     const task = TASKS[req.body && req.body.task];
     if (!task) return res.status(400).json({ ok: false, error: "task" });
+    let me;
+    if (task.public) me = { uid: "ip:" + req.ip, teacher: false };
+    else {
+      const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+      if (!token) return res.status(401).json({ ok: false, error: "auth" });
+      me = await whoIs(token);
+      if (!me) return res.status(401).json({ ok: false, error: "auth" });
+    }
     if (task.teacher && !me.teacher) return res.status(403).json({ ok: false, error: "forbidden" });
     if (limited(me.uid + ":" + req.body.task, task.max)) return res.status(429).json({ ok: false, error: "rate-limit" });
     const data = await askAI(task.prompt({ ...req.body, lang: req.body.lang === "en" ? "en" : "fr" }));
