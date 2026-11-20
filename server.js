@@ -71,31 +71,31 @@ ${BLOCKS}\nRéponse : {"blocks":[...]}` },
 Cours : ${D(b.courseTitle)}\nContenu : ${D(b.content)}
 Mélange : choix unique ("single", 3 ou 4 options, "answer" = indice), choix multiples ("multi", "answer" = liste d'indices), vrai ou faux ("tf", options ["Vrai","Faux"], "answer" = 0 ou 1). Ajoute "explain" (une phrase).
 Réponse : {"questions":[{"q":"...","type":"single","options":["..."],"answer":0,"explain":"..."}]}` },
-  site: { teacher: false, max: 15, public: true, prompt: b => `${L(b.lang)} Tu es l'assistant de Kivu Data Academy, un centre de formation en ligne et un incubateur ouverts à tous, partout dans le monde (enfants, étudiants, professionnels, ONG, startups). Réponds en moins de 120 mots, simplement, sans inventer.
+  site: { teacher: false, small: true, max: 15, public: true, prompt: b => `${L(b.lang)} Tu es l'assistant de Kivu Data Academy, un centre de formation en ligne et un incubateur ouverts à tous, partout dans le monde (enfants, étudiants, professionnels, ONG, startups). Réponds en moins de 120 mots, simplement, sans inventer.
 Faits sûrs : inscription gratuite (page « Créer un compte ») ; cours composés de leçons à suivre dans l'ordre, chacune finie par une courte question ; test final avec 6 essais par période de 24 heures ; certificat vérifiable par code ou QR, avec badge numérique, partageable sur LinkedIn ; filières : IA, data, réseaux, cybersécurité, logistique, humanitaire et climat, enfants ; page « Formations » pour le catalogue ; page « Contact » pour écrire à l'équipe, devenir partenaire, sponsor, mentor ou formateur.
 Si tu ne sais pas (prix, dates, détails d'un cours précis), dis-le et renvoie vers la page Contact. Ne demande jamais de mot de passe ni de code.
 ${b.page ? "Page actuelle : " + D(b.page) : ""}\n${b.history ? "Échanges précédents : " + D(b.history) + "\n" : ""}Question : ${D(String(b.question || "").slice(0, 500))}
 Réponse : {"answer":"..."}` },
-  tutor: { teacher: false, max: 30, prompt: b => `${L(b.lang)} Tu es le tuteur d'un apprenant. Réponds à sa question en t'appuyant d'abord sur la leçon, en moins de 150 mots, avec un exemple simple. Si la question est hors sujet, ramène poliment à la leçon.
+  tutor: { teacher: false, small: true, max: 30, prompt: b => `${L(b.lang)} Tu es le tuteur d'un apprenant. Réponds à sa question en t'appuyant d'abord sur la leçon, en moins de 150 mots, avec un exemple simple. Si la question est hors sujet, ramène poliment à la leçon.
 Cours : ${D(b.courseTitle)}\nLeçon : ${D(b.lessonTitle)}\nContenu de la leçon : ${D(b.context)}\n${b.history ? "Échanges précédents : " + D(b.history) + "\n" : ""}Question : ${D(String(b.question || "").slice(0, 500))}
 Réponse : {"answer":"..."}` }
 };
 
-async function gemini(prompt, model) {
+async function gemini(prompt, model, small, think = false) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.6, maxOutputTokens: 4096 } })
+    method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(20000),
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.6, maxOutputTokens: small ? 700 : 4096, ...(think ? {} : { thinkingConfig: { thinkingBudget: 0 } }) } })
   });
-  if (!r.ok) throw new Error("gemini " + r.status);
+  if (!r.ok) { if (r.status === 400 && !think) return gemini(prompt, model, small, true); throw new Error("gemini " + r.status); }
   const txt = ((await r.json()).candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
   return JSON.parse(txt.replace(/^```json\s*|```$/g, "").trim());
 }
 
 const parseJson = txt => { const t = String(txt); const i = t.indexOf("{"), j = t.lastIndexOf("}"); return JSON.parse(i >= 0 && j > i ? t.slice(i, j + 1) : t); };
-async function openaiLike(url, key, model, prompt) {
+async function openaiLike(url, key, model, prompt, small) {
   const call = async json => {
-    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-      body: JSON.stringify({ model, temperature: 0.6, max_tokens: 4096, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], ...(json ? { response_format: { type: "json_object" } } : {}) }) });
+    const r = await fetch(url, { method: "POST", signal: AbortSignal.timeout(20000), headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+      body: JSON.stringify({ model, temperature: 0.6, max_tokens: small ? 700 : 4096, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], ...(json ? { response_format: { type: "json_object" } } : {}) }) });
     if (!r.ok) throw new Error(model + " " + r.status);
     return parseJson(((await r.json()).choices?.[0]?.message?.content) || "");
   };
@@ -140,19 +140,27 @@ async function oaiModels(name, base, key, fixed, pref, bad) {
     return best(d.map(m => m.id), pref, bad);
   });
 }
+const badUntil = {};
 const tryEach = async (name, ids, run) => {
   let last = new Error(name + " aucun modèle");
-  for (const m of ids) { try { return await run(m); } catch (e) { last = e; console.warn("IA " + name + " / " + m + " :", e.message); } }
+  const ok = ids.filter(m => !(badUntil[name + m] > Date.now()));
+  for (const m of (ok.length ? ok : ids)) {
+    try { return await run(m); } catch (e) {
+      last = e; console.warn("IA " + name + " / " + m + " :", e.message);
+      badUntil[name + m] = Date.now() + (/ 429$/.test(e.message) ? 120e3 : / 40[034]$/.test(e.message) ? 3600e3 : 60e3);
+    }
+  }
   delete cache[name]; throw last;
 };
-const providers = () => [
-  GEMINI_API_KEY && ["gemini", async p => tryEach("gemini", await geminiModels(), m => gemini(p, m))],
-  ...OAI.filter(([, k, u, m]) => E[k] && u && (m || true)).map(([n, k, base, fixed, pref, bad]) =>
-    (n === "custom" && !fixed) ? null : [n, async p => tryEach(n, await oaiModels(n, base, E[k], fixed, pref, bad), m => openaiLike(base + "/chat/completions", E[k], m, p))])
-].filter(Boolean);
-async function askAI(prompt) {
+const ORDER = (E.PROVIDER_ORDER || "groq,cerebras,gemini,mistral,openrouter,github,nvidia,custom").split(",").map(x => x.trim());
+const providers = small => [
+  GEMINI_API_KEY && ["gemini", async p => tryEach("gemini", await geminiModels(), m => gemini(p, m, small))],
+  ...OAI.filter(([n, k, u]) => E[k] && u).map(([n, k, base, fixed, pref, bad]) =>
+    (n === "custom" && !fixed) ? null : [n, async p => tryEach(n, await oaiModels(n, base, E[k], fixed, pref, bad), m => openaiLike(base + "/chat/completions", E[k], m, p, small))])
+].filter(Boolean).sort((x, y) => (ORDER.indexOf(x[0]) + 1 || 99) - (ORDER.indexOf(y[0]) + 1 || 99));
+async function askAI(prompt, small) {
   let last;
-  for (const [name, run] of providers()) {
+  for (const [name, run] of providers(small)) {
     try { return await run(prompt); } catch (e) { last = e; console.warn("IA " + name + " indisponible :", e.message); }
   }
   throw last || new Error("no-provider");
@@ -160,7 +168,7 @@ async function askAI(prompt) {
 
 app.post("/ai", async (req, res) => {
   try {
-    if (!providers().length || !FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID) return res.status(500).json({ ok: false, error: "server-not-configured" });
+    if (!providers(true).length || !FIREBASE_WEB_API_KEY || !FIREBASE_PROJECT_ID) return res.status(500).json({ ok: false, error: "server-not-configured" });
     const task = TASKS[req.body && req.body.task];
     if (!task) return res.status(400).json({ ok: false, error: "task" });
     let me;
@@ -173,7 +181,7 @@ app.post("/ai", async (req, res) => {
     }
     if (task.teacher && !me.teacher) return res.status(403).json({ ok: false, error: "forbidden" });
     if (limited(me.uid + ":" + req.body.task, task.max)) return res.status(429).json({ ok: false, error: "rate-limit" });
-    const data = await askAI(task.prompt({ ...req.body, lang: req.body.lang === "en" ? "en" : "fr" }));
+    const data = await askAI(task.prompt({ ...req.body, lang: req.body.lang === "en" ? "en" : "fr" }), !!task.small);
     res.json({ ok: true, data });
   } catch (e) {
     console.error(e.message);
