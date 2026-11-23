@@ -3,6 +3,7 @@
 //  /grade : correction du test final et création du certificat (les bonnes réponses restent ici).
 import express from "express";
 import { gradeCourse, HttpError } from "./grade.js";
+import { startPayment, settleOrder } from "./pay.js";
 
 const {
   PORT = 8787, GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL = "llama-3.3-70b-versatile", OPENROUTER_API_KEY, OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free",
@@ -14,6 +15,7 @@ const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 app.use(express.json({ limit: "60kb" }));
+app.use(express.urlencoded({ extended: false, limit: "20kb" }));
 app.use((req, res, next) => {
   const o = req.headers.origin;
   if (o && origins.includes(o)) { res.setHeader("Access-Control-Allow-Origin", o); res.setHeader("Vary", "Origin"); }
@@ -219,6 +221,51 @@ app.post("/grade", async (req, res) => {
     if (e instanceof HttpError) return res.status(e.status).json({ ok: false, error: e.code });
     console.error("GRADE ERREUR :", e && (e.code || e.name), "|", e && e.message);
     res.status(500).json({ ok: false, error: "grade-error", detail: String((e && (e.code || e.name)) || "").slice(0, 60) });
+  }
+});
+
+/* ----- Paiement (FlexPay) ----- */
+const authed = async req => {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!token) throw new HttpError(401, "auth");
+  const ad = await getAdmin();
+  let dec; try { dec = await ad.auth.verifyIdToken(token); } catch (e) { throw new HttpError(401, "auth"); }
+  return { ad, dec };
+};
+const fail = (res, e, tag) => {
+  if (e instanceof HttpError) return res.status(e.status).json({ ok: false, error: e.code });
+  console.error(tag, e && (e.code || e.name), "|", e && e.message);
+  res.status(500).json({ ok: false, error: "pay-error" });
+};
+app.post("/pay/start", async (req, res) => {
+  try {
+    const { ad, dec } = await authed(req);
+    if (limited(dec.uid + ":pay", 10)) throw new HttpError(429, "rate-limit");
+    res.json({ ok: true, ...(await startPayment({ db: ad.db, uid: dec.uid, courseId: req.body && req.body.courseId, plan: req.body && req.body.plan, method: req.body && req.body.method, phone: req.body && req.body.phone, env: process.env })) });
+  } catch (e) { fail(res, e, "PAY START ERREUR :"); }
+});
+app.post("/pay/status", async (req, res) => {
+  try {
+    const { ad, dec } = await authed(req);
+    const id = String((req.body && req.body.txId) || "");
+    if (!/^[A-Za-z0-9]{6,40}$/.test(id)) throw new HttpError(400, "tx");
+    const o = await ad.db.collection("orders").doc(id).get();
+    if (!o.exists || o.data().uid !== dec.uid) throw new HttpError(404, "order");
+    res.json({ ok: true, ...(await settleOrder({ db: ad.db, txId: id, env: process.env })) });
+  } catch (e) { fail(res, e, "PAY STATUS ERREUR :"); }
+});
+// Appelé par FlexPay après chaque paiement (GET = simple test de disponibilité). On revérifie toujours auprès de FlexPay.
+app.get("/pay/notify", (_, res) => res.send("OK"));
+app.post("/pay/notify", async (req, res) => {
+  try {
+    const b = req.body || {}, id = String(b.reference || "");
+    if (!/^[A-Za-z0-9]{6,40}$/.test(id)) return res.status(400).send("tx");
+    const ad = await getAdmin();
+    await settleOrder({ db: ad.db, txId: id, env: process.env });
+    res.send("OK");
+  } catch (e) {
+    if (e instanceof HttpError && e.status === 404) return res.status(404).send("order");
+    console.error("PAY NOTIFY ERREUR :", e && (e.code || e.name), "|", e && e.message); res.status(500).send("error");
   }
 });
 
