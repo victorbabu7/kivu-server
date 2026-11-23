@@ -1,6 +1,8 @@
 // Correction du test final côté serveur : les bonnes réponses ne quittent jamais ce serveur.
 // Fonctions pures + un gestionnaire qui reçoit la base de données (Admin SDK) en paramètre, donc testable sans Firebase.
 
+import { hasAccess } from "./access.js";
+
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export function newCode(rand = Math.random) {
   let s = ""; for (let i = 0; i < 8; i++) s += CODE_CHARS[Math.floor(rand() * CODE_CHARS.length)];
@@ -55,6 +57,7 @@ export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, a
   if (!cs.exists) throw new HttpError(404, "course");
   const course = cs.data();
   if (course.published !== true && course.authorId !== uid) throw new HttpError(404, "course");
+  if (course.authorId !== uid && !(await hasAccess(db, uid, courseId, course, now))) throw new HttpError(402, "payment-required");
   const quiz = Array.isArray(course.quiz) ? course.quiz : [];
   if (!quiz.length) throw new HttpError(400, "no-quiz");
 
@@ -84,10 +87,18 @@ export async function gradeCourse({ db, FieldValue, uid, token = {}, courseId, a
     if (!certCode) {
       const us = await db.collection("users").doc(uid).get();
       const name = (us.exists && us.data().name) || token.name || token.email || "";
+      // Signataires et organisation : copiés dans le certificat au moment de sa délivrance (il ne change plus ensuite).
+      const png = v => (typeof v === "string" && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(v) && v.length <= 40000) ? v : "";
+      const str = (v, n) => (typeof v === "string" ? v.slice(0, n) : "");
+      let au = {}, pr = {};
+      try { const a = await db.collection("users").doc(String(course.authorId || "_")).get(); if (a.exists) au = a.data(); } catch (e) {}
+      try { const p = await db.collection("settings").doc("promoter").get(); if (p.exists) pr = p.data(); } catch (e) {}
+      const extra = { org: str(au.org, 100), trainerTitle: str(au.title, 80), trainerSig: png(au.sig), partners: (Array.isArray(course.partners) ? course.partners : []).filter(x => typeof x === "string").slice(0, 6).map(x => x.slice(0, 60)),
+        promoter: { name: str(pr.name, 80), title: str(pr.title, 80), sig: png(pr.sig) } };
       for (let t = 0; t < 6 && !certCode; t++) {
         const code = newCode(rand);
         try {
-          await db.collection("certificates").doc(code).create({ code, uid, name, courseId, courseTitle: course.title || "", trainer: course.authorName || "", category: course.category || "", level: course.level || "", hours: Math.round((Number(course.duration) || 0) / 6) / 10 || null, skills: (Array.isArray(course.objectives) ? course.objectives : []).filter(x => typeof x === "string").slice(0, 4).map(x => x.slice(0, 120)), score: pct, date: FieldValue.serverTimestamp() });
+          await db.collection("certificates").doc(code).create({ code, uid, name, courseId, courseTitle: course.title || "", trainer: course.authorName || "", category: course.category || "", level: course.level || "", hours: Math.round((Number(course.duration) || 0) / 6) / 10 || null, skills: (Array.isArray(course.objectives) ? course.objectives : []).filter(x => typeof x === "string").slice(0, 4).map(x => x.slice(0, 120)), score: pct, ...extra, date: FieldValue.serverTimestamp() });
           certCode = code;
         } catch (e) { if (t === 5) throw e; }
       }
