@@ -18,13 +18,18 @@ const phone243 = p => { const d = String(p || "").replace(/\D/g, ""); if (d.star
 export async function startPayment({ db, uid, courseId, plan, method, phone, env, fetchFn = fetch, now = Date.now() }) {
   if (!env.FLEXPAY_TOKEN || !env.FLEXPAY_MERCHANT) throw new HttpError(503, "payment-not-configured");
   if (typeof courseId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(courseId)) throw new HttpError(400, "course");
-  if (plan !== "once" && plan !== "month") throw new HttpError(400, "plan");
+  if (plan !== "once" && plan !== "pass") throw new HttpError(400, "plan");
   const cs = await db.collection("courses").doc(courseId).get();
   if (!cs.exists || cs.data().published !== true) throw new HttpError(404, "course");
   const c = cs.data(), allowed = c.pay || "both";
   if (method !== "mobile" && method !== "card") throw new HttpError(400, "method");
   if (allowed !== "both" && allowed !== method) throw new HttpError(400, "method");
-  const amount = Math.round(Number(plan === "month" ? c.monthly : c.price));
+  let amount;
+  if (plan === "pass") {
+    if (c.passOk !== true) throw new HttpError(400, "no-pass");
+    const ps = await db.collection("settings").doc("pass").get();
+    amount = Math.round(Number(ps.exists ? ps.data().price : 0));
+  } else amount = Math.round(Number(c.price));
   if (!isPaid(c) || !(amount > 0)) throw new HttpError(400, "no-price");
   const currency = env.PAY_CURRENCY || "USD";
   const site = (env.PUBLIC_SITE_URL || "").replace(/\/$/, ""), me = (env.SERVER_URL || env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
@@ -70,14 +75,14 @@ export async function settleOrder({ db, txId, env, fetchFn = fetch, now = Date.n
   }
   await db.runTransaction(async tx => {
     const cur = await tx.get(ref); if (cur.data().status === "paid") return;
-    const eRef = db.collection("entitlements").doc(ord.uid + "_" + ord.courseId), e = await tx.get(eRef);
+    const isPass = ord.plan === "pass", eRef = db.collection("entitlements").doc(ord.uid + "_" + (isPass ? "ALL" : ord.courseId)), e = await tx.get(eRef);
     let until = null;
-    if (ord.plan === "month") {
+    if (isPass) {
       const old = e.exists ? e.data().until : undefined;
       if (e.exists && old == null) until = null;
       else { const base = Math.max(now, old && old.toMillis ? old.toMillis() : 0); until = new Date(base + 30 * DAY); }
     }
-    tx.set(eRef, { uid: ord.uid, courseId: ord.courseId, plan: ord.plan, until, txId, updatedAt: new Date(now) });
+    tx.set(eRef, { uid: ord.uid, courseId: isPass ? "ALL" : ord.courseId, plan: ord.plan, until, txId, updatedAt: new Date(now) });
     tx.update(ref, { status: "paid", paidAt: new Date(now) });
   });
   return { status: "paid", courseId: ord.courseId };
